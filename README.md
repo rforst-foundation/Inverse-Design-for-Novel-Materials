@@ -106,3 +106,6 @@ Standard neural networks struggle with physics because they don't inherently und
 * Research Collaborator
 * Gradient Descent Framework Lead
 * liviaguttieres@g.harvard.edu
+
+For a more detailed outline:
+https://docs.google.com/presentation/d/1YIbjUejRic7Cof8n74uQ9InoOZeTQQzzkNNatpPwD7U/edit?usp=sharing
