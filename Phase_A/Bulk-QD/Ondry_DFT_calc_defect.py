@@ -77,11 +77,18 @@ def calculations(engine: str, soc: bool, qe_pseudo_dir: str, spec: Spec):
             kpts=kmesh,
             command=command,
         )
-    elif engine == "emt":
-        from ase.calculators.emt import EMT
-        return EMT()
+    elif engine == "stub":
+        # Zero-force stub: returns E=0, F=0 for any structure.
+        # Exercises the full ASE/extxyz pipeline instantly — not physical data.
+        from ase.calculators.calculator import Calculator, all_changes
+        class ZeroCalc(Calculator):
+            implemented_properties = ["energy", "forces"]
+            def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
+                super().calculate(atoms, properties, system_changes)
+                self.results = {"energy": 0.0, "forces": np.zeros((len(self.atoms), 3))}
+        return ZeroCalc()
     else:
-        raise ValueError("Engine must be 'qe' or 'emt'")
+        raise ValueError("Engine must be 'qe' or 'stub'")
 
 
 def make_branch_calc(calc, label, base_outdir):
@@ -89,14 +96,17 @@ def make_branch_calc(calc, label, base_outdir):
     ase_label = f"qd_{label}"
     outdir = Path(base_outdir) / ase_label
     outdir.mkdir(parents=True, exist_ok=True)
-    c.label = str(outdir / ase_label)
-    inp = c.parameters["input_data"]
-    ctrl = inp["control"]
-    ctrl["prefix"] = ase_label
-    ctrl["outdir"] = str(outdir)
-    ctrl["restart_mode"] = "from_scratch"
-    inp["control"] = ctrl
-    c.parameters["input_data"] = inp
+
+    if hasattr(c, "parameters") and "input_data" in c.parameters:
+        c.label = str(outdir / ase_label)
+        inp = c.parameters["input_data"]
+        ctrl = inp["control"]
+        ctrl["prefix"] = ase_label
+        ctrl["outdir"] = str(outdir)
+        ctrl["restart_mode"] = "from_scratch"
+        inp["control"] = ctrl
+        c.parameters["input_data"] = inp
+
     return c
 
 
@@ -149,7 +159,7 @@ def aimd_snapshots(atoms: Atoms, calc, T=300, steps=30, dt_fs=1.0):
         mdl.run(1)
         # Wavefunction warm-restart after first SCF — cuts subsequent SCF iterations
         # from ~40 to ~3-5 since atoms move only ~0.001 Å per step at 300 K.
-        if i == 0 and hasattr(md_atoms.calc, "parameters"):
+        if i == 0 and hasattr(md_atoms.calc, "parameters") and "input_data" in md_atoms.calc.parameters:
             md_atoms.calc.parameters["input_data"]["control"]["restart_mode"] = "restart"
         energy = float(md_atoms.get_potential_energy())
         forces = md_atoms.get_forces()
@@ -249,7 +259,7 @@ def main(engine="qe", qe_pseudo_dir=None, num_vacancies=1):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--engine", default="qe", choices=["qe", "emt"])
+    p.add_argument("--engine", default="qe", choices=["qe", "stub"])
     p.add_argument("--qe-pseudo-dir", default=None)
     p.add_argument("--num-vacancies", type=int, default=1, choices=[1, 2],
                    help="Number of atoms to remove (1 or 2).")
