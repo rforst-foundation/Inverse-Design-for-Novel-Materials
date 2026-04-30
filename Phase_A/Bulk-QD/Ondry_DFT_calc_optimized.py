@@ -9,6 +9,7 @@ from ase.build import bulk
 from ase.io import write
 from ase.optimize import BFGS
 from ase.md.langevin import Langevin
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from tqdm.auto import tqdm
 
 # Replicated Wurtzite Crystal Structure for a CdS/CdSe Quantum Dot in Ondry et al. ACS Nano 2021
@@ -62,25 +63,38 @@ def hex_monolayer(spec: Spec) -> Atoms:
 # EMT is for analytical pair potential - Only for testing, runs instantly and produces eneries/forces for debugging the ASE/NequIP pipeline better
 
 
-def calculations(engine: str, soc: bool, qe_pseudo_dir: str, spec: Spec):
+def calculations(engine: str, soc: bool, qe_pseudo_dir: str, spec: Spec,
+                 nprocs: int = 1, npool: int = 1):
     qe_pseudo_dir = str(Path(qe_pseudo_dir).expanduser().resolve())
     engine = engine.lower()
     kmesh = (spec.k, spec.k, 1)
     if engine == "qe":
         from ase.calculators.espresso import Espresso
         psp = {"Cd" : "Cd.pbe-dn-rrkjus_psl.0.3.1.UPF", "S" : "s_pbe_v1.4.uspp.F.UPF", "Se" : "Se_pbe_v1.uspp.F.UPF"}
-        ctrl = dict(calculation="scf", prefix="qd", pseudo_dir=qe_pseudo_dir, outdir=".", tprnfor = True, restart_mode="from_scratch")
-        syst = dict(ibrav=0, ecutwfc=70.0, ecutrho=560.0, occupations="smearing", degauss = 0.01, nosym=False, noinv=False)
+        ctrl = dict(calculation="scf", prefix="qd", pseudo_dir=qe_pseudo_dir, outdir=".", tprnfor=True, restart_mode="from_scratch")
+        syst = dict(ibrav=0, ecutwfc=70.0, ecutrho=560.0, occupations="smearing", degauss=0.01, nosym=False, noinv=False)
         qe_assume_isolated = os.environ.get("QE_ASSUME_ISOLATED")
         if qe_assume_isolated:
             syst["assume_isolated"] = qe_assume_isolated
         if soc:
             syst.update(noncolin=True, lspinorb=True)
-        elec = dict(conv_thr=1e-5, mixing_beta=0.2, mixing_mode = "plain", electron_maxstep = 150)  # OPTIMIZED: relaxed conv_thr, increased mixing_beta for faster convergence, reduced maxstep
+        elec = dict(
+            conv_thr=1e-5,
+            mixing_mode="local-TF",   # better than 'plain' for slab+vacuum: adapts mixing wavevector to local density
+            mixing_beta=0.3,          # safe to raise from 0.2 with local-TF; fewer iterations per SCF
+            mixing_ndim=12,           # Broyden history depth (default 8); more history → less oscillation near convergence
+            electron_maxstep=100,     # warm-restart keeps iterations low; 100 is still a conservative cap
+        )
         for sym, fname in psp.items():
             if not (Path(qe_pseudo_dir)/fname).exists():
-                raise FileNotFoundError(f"Mssing UPF for {sym}: {qe_pseudo_dir}/{fname}")
-        command = os.environ.get("ASE_ESPRESSO_COMMAND") or os.environ.get("ESPRESSO_COMMAND") or "pw.x -in PREFIX.pwi > PREFIX.pwo"
+                raise FileNotFoundError(f"Missing UPF for {sym}: {qe_pseudo_dir}/{fname}")
+        # Allow cluster launcher (srun, aprun, etc.) to override via env var.
+        # -npool K distributes k-points across K MPI groups — linear speedup with K.
+        if nprocs > 1:
+            default_cmd = f"mpirun -np {nprocs} pw.x -npool {npool} -in PREFIX.pwi > PREFIX.pwo"
+        else:
+            default_cmd = "pw.x -in PREFIX.pwi > PREFIX.pwo"
+        command = os.environ.get("ASE_ESPRESSO_COMMAND") or os.environ.get("ESPRESSO_COMMAND") or default_cmd
         return Espresso(
             input_data={"control": ctrl, "system": syst, "electrons": elec},
             pseudopotentials=psp,
@@ -134,18 +148,22 @@ def generate_vacancies(atoms, num_vacancies=1):
 def relaxation(atoms: Atoms, calc, fmax=0.03, steps=15, label = "relaxation") -> Atoms:
     a = atoms.copy()
     a.calc = calc
-    pbar = tqdm(total=steps, desc=f"Relaxation ({label})", unit = "step" )
+    pbar = tqdm(total=steps, desc=f"Relaxation ({label})", unit="step")
     opt = BFGS(a, logfile=None)
-    def print_step(*args, **kwargs):
-        done = min(opt.nsteps, steps)
-        pbar.n = done
+    def on_step():
+        pbar.n = min(opt.nsteps, steps)
         pbar.refresh()
-    opt.attach(print_step, interval = 1)
-    opt.run(fmax=fmax, steps=steps) #updates atomic positions to minimize total energy, stops when all forces are < fmax=0.02 eV/A
+        # After the first SCF completes, switch to wavefunction warm-restart.
+        # Subsequent BFGS steps start from the converged density of the previous
+        # geometry (~0.01-0.05 Å away), cutting SCF iterations from ~40 to ~5-10.
+        if hasattr(a.calc, "parameters"):
+            a.calc.parameters["input_data"]["control"]["restart_mode"] = "restart"
+    opt.attach(on_step, interval=1)
+    opt.run(fmax=fmax, steps=steps)
     pbar.close()
-    a.info["energy"] = float(a.get_potential_energy()) #total energy in eV
-    a.arrays["forces"] = a.get_forces() #forces in eV/A
-    a.calc =  None
+    a.info["energy"] = float(a.get_potential_energy())
+    a.arrays["forces"] = a.get_forces()
+    a.calc = None
     return a
 
 # Runs a geometry optimization
@@ -168,17 +186,26 @@ def strain(atoms: Atoms, pct: float) -> Atoms:
 def aimd_snapshots(atoms: Atoms, calc, T=300, steps=8, dt_fs=1.0):
     frames = []
     md_atoms = atoms.copy()
+    # Pre-sample velocities at T so every frame is immediately valid thermal data.
+    # Without this, the Langevin thermostat thermalizes from rest over ~3-4 steps,
+    # wasting a significant fraction of the short run.
+    MaxwellBoltzmannDistribution(md_atoms, temperature_K=T)
     md_atoms.calc = calc
-    mdl = Langevin(md_atoms, dt_fs*units.fs, temperature_K=T, friction = 0.02)
+    mdl = Langevin(md_atoms, dt_fs*units.fs, temperature_K=T, friction=0.02)
 
-    pbar = tqdm(total=steps, desc=f"AIMD {T}K", unit = "step")
+    pbar = tqdm(total=steps, desc=f"AIMD {T}K", unit="step")
 
-    for _ in range(steps):
+    for i in range(steps):
         mdl.run(1)
-        
+        # At T=300 K with dt=1 fs, atoms move ~0.001 Å per step — the wavefunction
+        # from the previous step is an excellent starting guess, cutting SCF
+        # iterations from ~40 to ~3-5 for all steps after the first.
+        if i == 0 and hasattr(md_atoms.calc, "parameters"):
+            md_atoms.calc.parameters["input_data"]["control"]["restart_mode"] = "restart"
+
         energy = float(md_atoms.get_potential_energy())
         forces = md_atoms.get_forces()
-        
+
         fr = md_atoms.copy()
         fr.info["energy"] = energy
         fr.arrays["forces"] = forces
@@ -216,15 +243,12 @@ def generate_displacements(atoms, displacement_magnitude=0.01):
 
 
 #MAIN BODY
-# AGGRESSIVELY OPTIMIZED VERSION: Significantly reduced step counts and computational parameters:
-# - k-points: 3→2 (faster SCF)
-# - SCF convergence: 1e-6→1e-5 (faster convergence)
-# - Base relaxation: 40→15 steps, fmax: 0.02→0.03
-# - Frozen phonon: 5→3 structures
-# - Strain points: 5→3 (-2, 0, +2%), steps: 20→8, fmax: 0.03→0.05
-# - AIMD temperatures: 3→2 (300, 450K), steps: 20→8
+# Dataset parameters (≈103 frames when combined):
+# - Frozen phonons: 8 frames (was 3)
+# - Strain: ±2% × 20 BFGS steps (was 8 — not enough to converge at ±2%)
+# - AIMD: 300 K, 450 K, 600 K × 30 steps each (was 300/450 K × 8 steps)
 
-def main(engine="qe", qe_pseudo_dir=None):
+def main(engine="qe", qe_pseudo_dir=None, nprocs=1, npool=1):
     out = Path(__file__).resolve().parent #sets output to current directory
     scratch_root = out / "qe_work"
     if scratch_root.exists():
@@ -245,7 +269,8 @@ def main(engine="qe", qe_pseudo_dir=None):
 
     #exit()
 
-    base_calc_template = calculations(engine, spec.soc, qe_pseudo_dir, spec)
+    base_calc_template = calculations(engine, spec.soc, qe_pseudo_dir, spec,
+                                      nprocs=nprocs, npool=npool)
 
 
     frames = []
@@ -259,58 +284,54 @@ def main(engine="qe", qe_pseudo_dir=None):
     rel.info["tag"]="relaxed_base"
     frames.append(rel) #Relaxed based ground-state
     
-    #Defect Loop
-    for vac_count in [1, 2]:
-        print(f"\n=== Generating Defects ===")
-        # 1.Create structure
-        defect_struct = generate_vacancies(rel, vac_count)
-        # 2. Attach calculator
-        d_calc = make_branch_calc(base_calc_template, f"vac_{vac_count}", scratch_root)
-        defect_struct.calc = d_calc
-        # 3. Run calculation
-        en = defect_struct.get_potential_energy()
-        forces = defect_struct.get_forces()
-        # 4. Store Data and detach calculator
-        defect_struct.info["energy"] = float(en)
-        defect_struct.arrays["forces"] = forces
-        defect_struct.calc = None
-
-        frames.append(defect_struct)
+    # Defect loop disabled — run Ondry_DFT_calc_defect.py for vacancy data
+    # for vac_count in [1, 2]:
+    #     print(f"\n=== Generating Defects ===")
+    #     defect_struct = generate_vacancies(rel, vac_count)
+    #     d_calc = make_branch_calc(base_calc_template, f"vac_{vac_count}", scratch_root)
+    #     defect_struct.calc = d_calc
+    #     en = defect_struct.get_potential_energy()
+    #     forces = defect_struct.get_forces()
+    #     defect_struct.info["energy"] = float(en)
+    #     defect_struct.arrays["forces"] = forces
+    #     defect_struct.calc = None
+    #     frames.append(defect_struct)
 
 
-    # Frozen-Phonon Loop
-    for i in range(3):
-        print(f"\n=== Generating Frozen-Phonons ===")
-        # 1. Create structure
+    # Frozen-Phonon Loop: 8 frames — minimum to sample the harmonic basin
+    # (3 was too few; each draw is independent noise so cost scales linearly)
+    for i in range(8):
+        print(f"\n=== Generating Frozen-Phonons {i+1}/8 ===")
         disp_struct = generate_displacements(rel, 0.01)
-        # 2. Attach calculator
         disp_calc = make_branch_calc(base_calc_template, f"phonon_disp_{i}", scratch_root)
         disp_struct.calc = disp_calc
-        # 3. Run calculation
         en = disp_struct.get_potential_energy()
         forces = disp_struct.get_forces()
-        # 4. Store data and detach calculator
         disp_struct.info["energy"] = float(en)
         disp_struct.arrays["forces"] = forces
         disp_struct.calc = None
-
         frames.append(disp_struct)
-    
-    #Strain and relaxation
-    for s in (-2.0, 0.0, 2.0):
+
+    # Strain and relaxation — 0% omitted (strain(rel,0)==rel, already in frames).
+    # steps=20: at ±2% biaxial strain initial forces are ~0.3-0.8 eV/Å;
+    # 8 steps does not reach fmax=0.05, leaving large residual forces.
+    for s in (-2.0, 2.0):
         print(f"\n=== Starting Strain {s:+.1f}% relaxation ===")
         strain_calc = make_branch_calc(base_calc_template, f"strain{s:+.1f}", scratch_root)
-        rs = relaxation(strain(rel, s), strain_calc, fmax=0.05, steps = 8, label = f"strain_{s:+.1f}")
-        rs.info["tag"]=f"strain_{s:+.1f}pct"
+        rs = relaxation(strain(rel, s), strain_calc, fmax=0.05, steps=20, label=f"strain_{s:+.1f}")
+        rs.info["tag"] = f"strain_{s:+.1f}pct"
         frames.append(rs)
-    
-    
-    
-    #AIMD
-    for T in (300, 450):
+
+    # AIMD: 300 K, 450 K, 600 K × 30 steps each.
+    # 8 steps = 8 fs, barely past Maxwell-Boltzmann initialization;
+    # 30 steps = 30 fs gives diverse configurations that are still correlated
+    # within the phonon period (~20-50 fs), staying below the diminishing-returns
+    # threshold where consecutive frames become redundant.
+    # 600 K added: samples anharmonic regime without approaching CdS melting (~1750 K).
+    for T in (300, 450, 600):
         print(f"\n=== Starting AIMD {T}K ===")
         aimd_calc = make_branch_calc(base_calc_template, f"aimd{T}K", scratch_root)
-        frames += aimd_snapshots(rel, aimd_calc, T=T, steps=8, dt_fs=1.0)
+        frames += aimd_snapshots(rel, aimd_calc, T=T, steps=30, dt_fs=1.0)
 
     #shuffle and split
     random.seed(0); random.shuffle(frames)
@@ -326,5 +347,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--engine", default="qe", choices=["qe", "emt"], help="Calculator backend.")
     p.add_argument("--qe-pseudo-dir", default=None, help="Directory containing QE UPF pseudopotentials.")
+    p.add_argument("--nprocs", type=int, default=1, help="MPI tasks passed to pw.x via mpirun -np.")
+    p.add_argument("--npool", type=int, default=1, help="k-point pools (-npool flag); set equal to number of irreducible k-points for linear speedup.")
     args = p.parse_args()
-    main(engine=args.engine, qe_pseudo_dir=args.qe_pseudo_dir)
+    main(engine=args.engine, qe_pseudo_dir=args.qe_pseudo_dir,
+         nprocs=args.nprocs, npool=args.npool)
