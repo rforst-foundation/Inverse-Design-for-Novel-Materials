@@ -59,8 +59,8 @@ def hex_monolayer(spec: Spec) -> Atoms:
     return slab
 
 # COMPUTE THE ENERGY AND FORCES FOR ATOMIC STRUCTURE
-# Using Quantum ESPRESSO (QE) and Effective Medium Theory (EMT)
-# EMT is for analytical pair potential - Only for testing, runs instantly and produces eneries/forces for debugging the ASE/NequIP pipeline better
+# Using Quantum ESPRESSO (QE) for real data, or a zero-force stub for pipeline testing
+# EMT only covers FCC metals and cannot handle Cd/Se/S — use --engine stub instead
 
 
 def calculations(engine: str, soc: bool, qe_pseudo_dir: str, spec: Spec,
@@ -101,11 +101,18 @@ def calculations(engine: str, soc: bool, qe_pseudo_dir: str, spec: Spec,
             kpts=kmesh,
             command=command,
         )
-    elif engine == "emt":
-        from ase.calculators.emt import EMT
-        return EMT()
+    elif engine == "stub":
+        # Zero-force stub: returns E=0, F=0 for any structure.
+        # Exercises the full ASE/extxyz pipeline instantly — not physical data.
+        from ase.calculators.calculator import Calculator, all_changes
+        class ZeroCalc(Calculator):
+            implemented_properties = ["energy", "forces"]
+            def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
+                super().calculate(atoms, properties, system_changes)
+                self.results = {"energy": 0.0, "forces": np.zeros((len(self.atoms), 3))}
+        return ZeroCalc()
     else:
-        raise ValueError("Engine must be 'qe' or 'emt'")
+        raise ValueError("Engine must be 'qe' or 'stub'")
 
 
 def make_branch_calc(calc, label, base_outdir):
@@ -115,17 +122,17 @@ def make_branch_calc(calc, label, base_outdir):
     outdir = Path(base_outdir) / ase_label
     outdir.mkdir(parents=True, exist_ok=True)
 
-    c.label = str(outdir / ase_label)
+    if hasattr(c, "parameters") and "input_data" in c.parameters:
+        c.label = str(outdir / ase_label)
+        inp = c.parameters["input_data"]
+        ctrl = inp["control"]
 
-    inp = c.parameters["input_data"]
-    ctrl = inp["control"]
-    
-    ctrl["prefix"] = ase_label
-    ctrl["outdir"] = str(outdir)
-    ctrl["restart_mode"] = "from_scratch"  # warm-start within THIS branch
+        ctrl["prefix"] = ase_label
+        ctrl["outdir"] = str(outdir)
+        ctrl["restart_mode"] = "from_scratch"  # warm-start within THIS branch
 
-    inp["control"]= ctrl
-    c.parameters["input_data"] = inp
+        inp["control"]= ctrl
+        c.parameters["input_data"] = inp
 
     return c
 
@@ -156,7 +163,7 @@ def relaxation(atoms: Atoms, calc, fmax=0.03, steps=15, label = "relaxation") ->
         # After the first SCF completes, switch to wavefunction warm-restart.
         # Subsequent BFGS steps start from the converged density of the previous
         # geometry (~0.01-0.05 Å away), cutting SCF iterations from ~40 to ~5-10.
-        if hasattr(a.calc, "parameters"):
+        if hasattr(a.calc, "parameters") and "input_data" in a.calc.parameters:
             a.calc.parameters["input_data"]["control"]["restart_mode"] = "restart"
     opt.attach(on_step, interval=1)
     opt.run(fmax=fmax, steps=steps)
@@ -200,7 +207,7 @@ def aimd_snapshots(atoms: Atoms, calc, T=300, steps=8, dt_fs=1.0):
         # At T=300 K with dt=1 fs, atoms move ~0.001 Å per step — the wavefunction
         # from the previous step is an excellent starting guess, cutting SCF
         # iterations from ~40 to ~3-5 for all steps after the first.
-        if i == 0 and hasattr(md_atoms.calc, "parameters"):
+        if i == 0 and hasattr(md_atoms.calc, "parameters") and "input_data" in md_atoms.calc.parameters:
             md_atoms.calc.parameters["input_data"]["control"]["restart_mode"] = "restart"
 
         energy = float(md_atoms.get_potential_energy())
@@ -345,7 +352,7 @@ def main(engine="qe", qe_pseudo_dir=None, nprocs=1, npool=1):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--engine", default="qe", choices=["qe", "emt"], help="Calculator backend.")
+    p.add_argument("--engine", default="qe", choices=["qe", "stub"], help="Calculator backend. Use 'stub' for pipeline testing (zero forces, no DFT).")
     p.add_argument("--qe-pseudo-dir", default=None, help="Directory containing QE UPF pseudopotentials.")
     p.add_argument("--nprocs", type=int, default=1, help="MPI tasks passed to pw.x via mpirun -np.")
     p.add_argument("--npool", type=int, default=1, help="k-point pools (-npool flag); set equal to number of irreducible k-points for linear speedup.")
